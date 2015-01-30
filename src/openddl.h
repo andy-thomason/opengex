@@ -33,8 +33,12 @@
 
 namespace openddl {
 
-typedef std::uint32_t node_index;
-typedef std::uint32_t data_index;
+typedef std::uint8_t uint8_t;
+typedef std::uint32_t uint32_t;
+typedef std::uint64_t uint64_t;
+
+typedef uint32_t node_index;
+typedef uint32_t data_index;
 
 enum class data_type_t : uint8_t {
   dt_invalid,
@@ -102,6 +106,7 @@ const char *data_type_name(data_type_t type) {
 
 class file {
 public:
+  /// construct an empty openddl file.
   file() {
     // node_index 0 is "null"
     nodes.emplace_back();
@@ -132,6 +137,7 @@ public:
     return 0;
   }
 
+  /// add a new child to a node. return the node index.
   node_index add_child(node_index parent) {
     node_index result = (node_index)nodes.size();
     nodes.emplace_back();
@@ -147,102 +153,174 @@ public:
     return result;
   }
 
+  /// set the ind for a node. (eg. GeometryNode)
   void set_kind(node_index ni, const std::string &val) {
     std::cout << "node kind " << ni << " " << val << "\n";
     nodes[ni].kind = add_string(val);
   }
 
+  /// set the name for a node. (eg. $object1)
   void set_name(node_index ni, const std::string &val) {
     std::cout << "node name " << ni << " " << val << "\n";
     nodes[ni].name = add_string(val);
   }
 
-  void set_data(node_index ni, const std::vector<std::uint8_t> &val) {
+  /// set the data for a node.
+  void set_data(node_index ni, const std::vector<uint8_t> &val) {
     std::cout << "node data " << ni << " " << val.size() << "\n";
     nodes[ni].data = add_data(val);
-    nodes[ni].data_size = (std::uint32_t)val.size();
+    nodes[ni].data_size = (uint32_t)val.size();
   }
 
+  /// set the data type for a node. (eg. dt_float)
   void set_data_type(node_index ni, data_type_t type) {
     nodes[ni].data_type = type;
   }
 
-  void set_data_group_size(node_index ni, std::uint8_t size) {
+  /// set the group size for a node (eg. float[3])
+  void set_data_group_size(node_index ni, uint8_t size) {
     nodes[ni].data_group_size = size;
   }
 
-  void set_props(node_index ni, const std::vector<std::uint8_t> &val) {
+  /// set the properties for a node
+  void set_props(node_index ni, const std::vector<uint8_t> &val) {
     std::cout << "node props " << ni << " " << val.size() << "\n";
     nodes[ni].props = add_data(val);
   }
 
-  void dump_node(std::ostream &os, node_index parent, std::string &indent) {
+  /// dump the node for debugging.
+  void dump_node(std::ostream &os, node_index parent, std::string &indent, std::string &temp) {
     node &par = nodes[parent];
-    indent.append("  ");
     for (node_index child = par.children; child != 0; child = nodes[child].siblings) {
       node &ch = nodes[child];
       const char *kind = get_kind(child);
       if (!kind[0]) {
-        int group_size = get_data_group_size(child);
+        const uint8_t *data = get_data(child);
+        size_t group_size = get_data_group_size(child);
+        size_t size = get_data_size(child);
+        data_type_t type = get_data_type(child);
+        const uint8_t *data_end = data + size;
+        size_t dt_size = data_type_size(type);
         if (group_size) {
-          os << indent << data_type_name(get_data_type(child)) << "[" << group_size << "] {\n";
+          os << indent << data_type_name(type) << "[" << std::dec << group_size << "] { ";
+
+          temp.resize(0);
+          while (data < data_end) {
+            temp.append("{");
+            for (size_t i = 0; i != group_size; ++i ) {
+              if (data < data_end) get_data_string(temp, type, dt_size, data);
+              data += dt_size;
+              if (i + 1 < group_size) temp.append(", ");
+            }
+            temp.append("}");
+            if (data < data_end) temp.append(", ");
+          }
+          os << temp << " }\n";
         } else {
-          os << indent << data_type_name(get_data_type(child)) << " {\n";
+          os << indent << data_type_name(get_data_type(child)) << " { ";
+          temp.resize(0);
+          while (data < data_end) {
+            if (data < data_end) get_data_string(temp, type, dt_size, data);
+            data += dt_size;
+            if (data < data_end) temp.append(", ");
+          }
+          os << temp << " }\n";
         }
-        os << indent << "}\n";
       } else {
-        os << indent << kind << " { " << get_name(child) << "\n";
-        dump_node(os, child, indent);
+        const uint8_t *props = get_properites(child);
+        if (props[0]) {
+          os << indent << kind << " " << get_prop_string(child, temp) << " { " << get_name(child) << "\n";
+        } else {
+          os << indent << kind << " { " << get_name(child) << "\n";
+        }
+        indent.append("  ");
+        dump_node(os, child, indent, temp);
+        indent.resize(indent.size() - 2);
         os << indent << "}\n";
       }
     }
-    indent.resize(indent.size() - 2);
   }
 
+  /// get the name of a node (eg. $object)
   const char *get_name(node_index child) const {
     return (const char*)(data.data() + nodes[child].data);
   }
 
+  /// get the kind of a node (eg. GeometryNode)
   const char *get_kind(node_index child) const {
     return (const char*)(data.data() + nodes[child].kind);
   }
 
-  std::pair<data_type_t, std::uint64_t> get_propery(node_index child, const std::string &name) const {
-    for (const std::uint8_t *p = data.data() + nodes[child].props; *p; ) {
+  /// get an abitrary string, such as from a property
+  const char *get_string(data_index index) const {
+    return (const char*)(data.data() + index);
+  }
+
+  std::pair<data_type_t, uint64_t> get_property(node_index child, const std::string &name) const {
+    for (const uint8_t *p = data.data() + nodes[child].props; *p; ) {
       const char *this_name = (const char*)p;
       while (*p) ++p;
       p += 2;
       data_type_t type = (data_type_t)p[-1];
       size_t size = data_type_size(type);
       if (name == this_name) {
-        std::uint64_t value = 0;
-        while (size) { --size; value = *p++ << (size*8); }
-        return std::make_pair(type, (std::uint64_t)0);
+        uint64_t value = 0;
+        for (size_t i = 0; i != size; ++i) {
+          value |= p[i] << (i*8);
+        }
+        return std::make_pair(type, (uint64_t)0);
       }
       p += size;
     }
-    return std::make_pair(data_type_t::dt_invalid, (std::uint64_t)0);
+    return std::make_pair(data_type_t::dt_invalid, (uint64_t)0);
   }
 
+  /// get properties as a string
+  std::string &get_prop_string(node_index child, std::string &str) const {
+    str.resize(0);
+    str.append("(");
+    for (const uint8_t *p = data.data() + nodes[child].props; *p; ) {
+      const char *this_name = (const char*)p;
+      while (*p) ++p;
+      str.append(this_name, (const char*)p);
+      str.append(" = ");
+      p += 2;
+      data_type_t type = (data_type_t)p[-1];
+      size_t size = data_type_size(type);
+      get_data_string(str, type, size, p);
+      p += size;
+      if (*p) str.append(", ");
+    }
+    str.append(")");
+    return str;
+  }
+
+  /// Get the size of the data for a node.
   data_index get_data_size(node_index child) const {
     return nodes[child].data_size;
   }
 
+  /// Get the type of the data for a node. (eg. dt_float)
   data_type_t get_data_type(node_index child) const {
     return nodes[child].data_type;
   }
 
-  std::uint8_t get_data_group_size(node_index child) const {
+  /// Get the group size of the data for a node. (eg. 3 in float[3])
+  uint8_t get_data_group_size(node_index child) const {
     return nodes[child].data_group_size;
   }
 
-  template <class _Iter> void get_data(node_index child, _Iter dest) const {
-    size_t size = nodes[child].data_size;
-    const std::uint8_t *src = data.data() + nodes[child].data;
-    while (size) *dest++ = *src++;
+  /// Get a pointer to the data for a node
+  const uint8_t *get_data(node_index child) const {
+    return data.data() + nodes[child].data;
   }
 
-  /// add a string to the data for a node.
+  /// Get a pointer to the properties for a node
+  const uint8_t *get_properites(node_index child) const {
+    return data.data() + nodes[child].props;
+  }
+
+  /// add a string to the file and get the data index.
   data_index add_string(const std::string &str) {
     data_index result = (data_index)data.size();
     data.insert(data.end(), str.begin(), str.end());
@@ -250,24 +328,25 @@ public:
     return result;
   }
 
-  /// add a string to the data for a node.
-  data_index add_data(const std::vector<std::uint8_t> &val) {
+  /// add data to the file and get the data index.
+  data_index add_data(const std::vector<uint8_t> &val) {
     data_index result = (data_index)data.size();
     data.insert(data.end(), val.begin(), val.end());
     return result;
   }
 
-  /// add a literal to a node.
-  data_index add_literal(std::uint64_t literal_val, size_t size) {
+  /// add a literal to the file and get the data index.
+  data_index add_literal(uint64_t literal_val, size_t size) {
     data_index result = (data_index)data.size();
     while (size--) {
-      data.push_back((std::uint8_t)literal_val);
+      data.push_back((uint8_t)literal_val);
       literal_val >>= 8;
     }
     return result;
   }
 
 private:
+  /// internal POD representation of a node.
   struct node {
     data_index kind = 0;
     data_index name = 0;
@@ -281,20 +360,77 @@ private:
     node_index siblings = 0;
 
     data_type_t data_type = data_type_t::dt_invalid;
-    std::uint8_t data_group_size = 0;
+    uint8_t data_group_size = 0;
   };
 
+  /// dump binary data
+  std::string &get_data_string(std::string &temp, data_type_t type, size_t size, const uint8_t *data) const {
+    const uint8_t *begin = data;
+    uint64_t value = 0;
+    for (size_t i = 0; i != size; ++i) {
+      value |= *data++ << (i*8);
+    }
+    char tmp[32];
+
+    switch (type) {
+      case data_type_t::dt_bool: {
+        temp.append(value ? "true" : "false");
+      } break;
+      default:
+      case data_type_t::dt_int8: 
+      case data_type_t::dt_int16:
+      case data_type_t::dt_int32:
+      case data_type_t::dt_int64: {
+        _i64toa_s((std::int64_t)value << (8-size) >> (8 - size), tmp, sizeof(tmp), 10);
+        temp.append(tmp);
+      } break;
+      case data_type_t::dt_unsigned_int8:
+      case data_type_t::dt_unsigned_int16:
+      case data_type_t::dt_unsigned_int32:
+      case data_type_t::dt_unsigned_int64: {
+        _ui64toa_s((std::int64_t)value << (8-size) >> (8 - size), tmp, sizeof(tmp), 10);
+        temp.append(tmp);
+      } break;
+      case data_type_t::dt_float: {
+        tmp[0] = '0'; tmp[1] = 'x';
+        _ui64toa_s((std::uint32_t)value, tmp+2, sizeof(tmp)-2, 16);
+        temp.append(tmp);
+      } break;
+
+      case data_type_t::dt_double: {
+        tmp[0] = '0'; tmp[1] = 'x';
+        _ui64toa_s(value, tmp+2, sizeof(tmp)-2, 16);
+        temp.append(tmp);
+      } break;
+      case data_type_t::dt_string: {
+        // todo: handle escapes
+        temp.append("\"");
+        temp.append(get_string((data_index)value));
+        temp.append("\"");
+      } break;
+      case data_type_t::dt_ref: {
+        temp.append(value ? get_name((node_index)value) : "null");
+      } break;
+      case data_type_t::dt_type: {
+        temp.append(data_type_name((data_type_t)value));
+      } break;
+    }
+    return temp;
+  }
+
   std::vector<node> nodes;
-  std::vector<std::uint8_t> data;
+  std::vector<uint8_t> data;
 };
 
+/// operator for serialising a file.
 std::ostream &operator<<(std::ostream &os, openddl::file &file) {
   std::string indent;
-  file.dump_node(os, 0, indent);
+  std::string temp;
+  file.dump_node(os, 0, indent, temp);
   return os;
 }
 
-
+/// parser for openddl ASCII file format.
 template <class _Char, class _Err> class parser {
   typedef typename _Char char_t;
   const char_t *begin;
@@ -305,8 +441,8 @@ template <class _Char, class _Err> class parser {
 
   std::string identifier_val;
   std::string string_val;
-  std::uint64_t literal_val;
-  std::vector<std::uint8_t> data_val;
+  uint64_t literal_val;
+  std::vector<uint8_t> data_val;
   _Err err_func;
 
   template <class... args> bool err(args... a) {
@@ -442,7 +578,7 @@ template <class _Char, class _Err> class parser {
   std::bitset<128> escape_char_set;
 
   uint64_t to_hex(char_t c) {
-    return (c <= '9' ? c : (c-6)) & 0x0f;
+    return (c <= '9' ? c : (c-'A'+10)) & 0x0f;
   }
 
   bool escape_char() {
@@ -729,12 +865,13 @@ template <class _Char, class _Err> class parser {
 
   template <class _Fn> bool data_array(node_index this_node, data_type_t type, size_t group_size, bool grouped, _Fn literal) {
     size_t size = data_type_size(type);
+    data_val.resize(0);
     if (grouped) {
       while (is('{')) {
         size_t gs = 0;
         while (literal(type)) {
           for (size_t i = 0; i != size; ++i) {
-            data_val.push_back((std::uint8_t)literal_val);
+            data_val.push_back((uint8_t)literal_val);
             literal_val >>= 8;
           }
           gs++;
@@ -747,7 +884,7 @@ template <class _Char, class _Err> class parser {
     } else {
       while (literal(type)) {
         for (size_t i = 0; i != size; ++i) {
-          data_val.push_back((std::uint8_t)literal_val);
+          data_val.push_back((uint8_t)literal_val);
           literal_val >>= 8;
         }
         if (!is(',')) break;
@@ -799,30 +936,29 @@ template <class _Char, class _Err> class parser {
     const char_t *save = src;
     if (identifier() && is('=')) {
       push_string(data_val, identifier_val);
-      data_val.push_back(0);
       if (bool_literal()) {
-        data_val.push_back((std::uint8_t)data_type_t::dt_bool);
-        data_val.push_back((std::uint8_t)literal_val);
+        data_val.push_back((uint8_t)data_type_t::dt_bool);
+        data_val.push_back((uint8_t)literal_val);
         return true;
       } else if (float_literal(data_type_t::dt_double)) {
-        data_val.push_back((std::uint8_t)data_type_t::dt_double);
+        data_val.push_back((uint8_t)data_type_t::dt_double);
         push_val(data_val, literal_val);
         return true;
       } else if (integer_literal(data_type_t::dt_int64)) {
-        data_val.push_back((std::uint8_t)data_type_t::dt_int64);
+        data_val.push_back((uint8_t)data_type_t::dt_int64);
         push_val(data_val, literal_val);
         return true;
       } else if (string_literal()) {
-        data_val.push_back((std::uint8_t)data_type_t::dt_string);
-        push_string(data_val, string_val);
+        data_val.push_back((uint8_t)data_type_t::dt_string);
+        push_val(data_val, (data_index)literal_val);
         return true;
       } else if (reference(parent)) {
-        data_val.push_back((std::uint8_t)data_type_t::dt_ref);
+        data_val.push_back((uint8_t)data_type_t::dt_ref);
         push_val(data_val, (node_index)literal_val);
         return true;
       } else if (data_type()) {
-        data_val.push_back((std::uint8_t)data_type_t::dt_type);
-        data_val.push_back((std::uint8_t)literal_val);
+        data_val.push_back((uint8_t)data_type_t::dt_type);
+        data_val.push_back((uint8_t)literal_val);
         return true;
       }
     }
@@ -884,6 +1020,7 @@ template <class _Char, class _Err> class parser {
           if (!is(',')) break;
         }
         if (!expect(')')) return false;
+        data_val.push_back(0);
         ddl->set_props(parent, data_val);
       }
 
@@ -909,14 +1046,14 @@ template <class _Char, class _Err> class parser {
     return src == end;
   }
 
-  static void push_string(std::vector<std::uint8_t> &dest, const std::string &src) {
+  static void push_string(std::vector<uint8_t> &dest, const std::string &src) {
     dest.insert(dest.end(), src.begin(), src.end());
     dest.push_back(0);
   }
 
-  template<class _Type> static void push_val(std::vector<std::uint8_t> &dest, _Type t) {
+  template<class _Type> static void push_val(std::vector<uint8_t> &dest, _Type t) {
     size_t size = sizeof(t);
-    while (size--) { dest.push_back((std::uint8_t)t); t >>= 8; }
+    while (size--) { dest.push_back((uint8_t)t); t >>= 8; }
   }
 public:
   parser(_Err err_func) : err_func(err_func) {
