@@ -37,8 +37,50 @@ typedef std::uint8_t uint8_t;
 typedef std::uint32_t uint32_t;
 typedef std::uint64_t uint64_t;
 
-typedef uint32_t node_index;
+typedef int32_t struct_index;
 typedef uint32_t data_index;
+
+inline static const char *uint64_to_dec(char *tmp, uint64_t t) {
+  char *p = tmp;
+  if (t == 0) { p[0] = '0'; p[1] = 0; return tmp; }
+  static const uint64_t p10[] = {
+    10000000000000000000ull, 1000000000000000000, 100000000000000000, 10000000000000000, 1000000000000000,
+    100000000000000, 10000000000000, 1000000000000, 100000000000, 10000000000,
+    1000000000, 100000000, 10000000, 1000000, 100000,
+    10000, 1000, 100, 10, 1, 0
+  };
+  int inc = 0;
+  for (int i = 0; i != 20; ++i) {
+    uint64_t u = p10[i];
+    int d = '0';
+    if (t >= u*8) { d += 8; t -= u*8; }
+    if (t >= u*4) { d += 4; t -= u*4; }
+    if (t >= u*2) { d += 2; t -= u*2; }
+    if (t >= u*1) { d += 1; t -= u*1; }
+    if (d != '0') inc = 1;
+    *p = d;
+    p += inc;
+  }
+  *p = 0;
+  return tmp;
+}
+
+inline static const char *uint64_to_hex(char *tmp, uint64_t t) {
+  char *p = tmp;
+  if (t == 0) { p[0] = '0'; p[1] = 0; return tmp; }
+  int i = 0;
+  while ((t >> 60) == 0) { ++i; t <<= 4; }
+  for (; i != 16; ++i) {
+    int d = t >> 60;
+    *p++ = "0123456789abcdef"[d];
+    t <<= 4;
+  }
+  *p = 0;
+  return tmp;
+}
+
+
+
 
 enum class data_type_t : uint8_t {
   dt_invalid,
@@ -78,7 +120,7 @@ size_t data_type_size(data_type_t type) {
     case data_type_t::dt_unsigned_int64:
     case data_type_t::dt_double: return 8;
 
-    case data_type_t::dt_string: return sizeof(node_index);
+    case data_type_t::dt_string: return sizeof(struct_index);
     case data_type_t::dt_ref: return sizeof(data_index);
   }
 }
@@ -108,16 +150,38 @@ class file {
 public:
   /// construct an empty openddl file.
   file() {
-    // node_index 0 is "null"
-    nodes.emplace_back();
+    // struct_index 0 is "null"
+    structs.emplace_back();
 
     // data_index 0 is ""
     data.push_back(0);
   }
 
-  /// find a global node or return 0.
-  node_index get_global(const std::string &name) const {
-    for (node_index ni = 0; ni != nodes.size(); ++ni) {
+  /// iterate over all structs by kind (ie. all GeometryNodes)
+  template <class _Fn> void for_all_structs_by_kind(const std::string &kind, _Fn fn) {
+    for (struct_index ni = 0; ni != structs.size(); ++ni) {
+      struct_type &nd = structs[ni];
+      if (nd.kind && kind == get_kind(ni)) {
+        fn(ni);
+      }
+    }
+  }
+
+  /// iterate over child structs by kind (ie. all VertexArray structs in a mesh)
+  template <class _Fn> void for_structs_by_kind(struct_index parent, const std::string &kind, _Fn fn) {
+    for (struct_index ni = structs[parent].children; ni != 0; ni = structs[ni].siblings) {
+      struct_type &nd = structs[ni];
+      if (nd.kind && kind == get_kind(ni)) {
+        fn(ni);
+      }
+    }
+  }
+
+  /// find a global struct_type or return 0.
+  struct_index get_global(const std::string &name) const {
+    for (struct_index ni = 0; ni != structs.size(); ++ni) {
+      //std::cout << "get_global " << name << " == " << get_name(ni) << "?\n";
+      const char *s = get_name(ni);
       if (name == get_name(ni)) {
         return ni;
       }
@@ -125,10 +189,22 @@ public:
     return 0;
   }
 
-  /// find a child node or return 0.
-  node_index get_child(node_index parent, const std::string &name) {
+  /// find a global struct_type or return 0.
+  struct_index get_local(struct_index parent, const std::string &name) const {
+    for (;;) {
+      if (struct_index result = get_child(parent, name)) {
+        return result;
+      }
+      if (!parent) return 0;
+      parent = get_parent(parent);
+    }
+    return 0;
+  }
+
+  /// find a child struct_type or return 0.
+  struct_index get_child(struct_index parent, const std::string &name) const {
     if (!name.empty()) {
-      for (node_index child = nodes[parent].children; child != 0; child = nodes[child].siblings) {
+      for (struct_index child = structs[parent].children; child != 0; child = structs[child].siblings) {
         if (name == get_name(child)) {
           return child;
         }
@@ -137,15 +213,15 @@ public:
     return 0;
   }
 
-  /// add a new child to a node. return the node index.
-  node_index add_child(node_index parent) {
-    node_index result = (node_index)nodes.size();
-    nodes.emplace_back();
-    node &par = nodes[parent];
-    node &child = nodes[result];
+  /// add a new child to a struct_type. return the struct_type index.
+  struct_index new_structure(struct_index parent) {
+    struct_index result = (struct_index)structs.size();
+    structs.emplace_back();
+    struct_type &par = structs[parent];
+    struct_type &child = structs[result];
 
     if (par.last_child) {;
-      nodes[par.last_child].siblings = result;
+      structs[par.last_child].siblings = result;
     } else {
       par.children = result;
     }
@@ -153,46 +229,59 @@ public:
     return result;
   }
 
-  /// set the ind for a node. (eg. GeometryNode)
-  void set_kind(node_index ni, const std::string &val) {
-    std::cout << "node kind " << ni << " " << val << "\n";
-    nodes[ni].kind = add_string(val);
+  /// set the ind for a struct_type. (eg. GeometryNode)
+  void set_kind(struct_index ni, const std::string &val) {
+    //std::cout << "struct_type kind " << ni << " " << val << "\n";
+    structs[ni].kind = add_string(val);
   }
 
-  /// set the name for a node. (eg. $object1)
-  void set_name(node_index ni, const std::string &val) {
-    std::cout << "node name " << ni << " " << val << "\n";
-    nodes[ni].name = add_string(val);
+  /// set the name for a struct_type. (eg. $object1)
+  void set_name(struct_index ni, const std::string &val) {
+    //std::cout << "struct_type name " << ni << " " << val << "\n";
+    structs[ni].name = add_string(val);
   }
 
-  /// set the data for a node.
-  void set_data(node_index ni, const std::vector<uint8_t> &val) {
-    std::cout << "node data " << ni << " " << val.size() << "\n";
-    nodes[ni].data = add_data(val);
-    nodes[ni].data_size = (uint32_t)val.size();
+  /// set the data for a struct_type.
+  void set_data(struct_index ni, const std::vector<uint8_t> &val) {
+    //std::cout << "struct_type data " << ni << " " << val.size() << "\n";
+    structs[ni].data = add_data(val);
+    structs[ni].data_size = (data_index)val.size();
   }
 
-  /// set the data type for a node. (eg. dt_float)
-  void set_data_type(node_index ni, data_type_t type) {
-    nodes[ni].data_type = type;
+  /// set the data start if we have alread pushed the values into the ddl data array
+  void set_data_start(struct_index ni, data_index start) {
+    //std::cout << "struct_type data " << ni << " " << val.size() << "\n";
+    structs[ni].data = start;
   }
 
-  /// set the group size for a node (eg. float[3])
-  void set_data_group_size(node_index ni, uint8_t size) {
-    nodes[ni].data_group_size = size;
+  /// set the data for a struct_type.
+  void set_data_size(struct_index ni, size_t size) {
+    //std::cout << "struct_type data " << ni << " " << val.size() << "\n";
+    structs[ni].data_size = (data_index)size;
   }
 
-  /// set the properties for a node
-  void set_props(node_index ni, const std::vector<uint8_t> &val) {
-    std::cout << "node props " << ni << " " << val.size() << "\n";
-    nodes[ni].props = add_data(val);
+
+  /// set the data type for a struct_type. (eg. dt_float)
+  void set_data_type(struct_index ni, data_type_t type) {
+    structs[ni].data_type = type;
   }
 
-  /// dump the node for debugging.
-  void dump_node(std::ostream &os, node_index parent, std::string &indent, std::string &temp) {
-    node &par = nodes[parent];
-    for (node_index child = par.children; child != 0; child = nodes[child].siblings) {
-      node &ch = nodes[child];
+  /// set the group size for a struct_type (eg. float[3])
+  void set_data_group_size(struct_index ni, uint8_t size) {
+    structs[ni].data_group_size = size;
+  }
+
+  /// set the properties for a struct_type
+  void set_props(struct_index ni, const std::vector<uint8_t> &val) {
+    //std::cout << "struct_type props " << ni << " " << val.size() << "\n";
+    structs[ni].props = add_data(val);
+  }
+
+  /// dump the struct_type for debugging.
+  void dump_node(std::ostream &os, struct_index parent, std::string &indent, std::string &temp) {
+    struct_type &par = structs[parent];
+    for (struct_index child = par.children; child != 0; child = structs[child].siblings) {
+      struct_type &ch = structs[child];
       const char *kind = get_kind(child);
       if (!kind[0]) {
         const uint8_t *data = get_data(child);
@@ -201,8 +290,9 @@ public:
         data_type_t type = get_data_type(child);
         const uint8_t *data_end = data + size;
         size_t dt_size = data_type_size(type);
+        const char *name = get_name(child);
         if (group_size) {
-          os << indent << data_type_name(type) << "[" << std::dec << group_size << "] { ";
+          os << indent << data_type_name(type) << " " << name << "[" << std::dec << group_size << "] { ";
 
           temp.resize(0);
           while (data < data_end) {
@@ -217,7 +307,7 @@ public:
           }
           os << temp << " }\n";
         } else {
-          os << indent << data_type_name(get_data_type(child)) << " { ";
+          os << indent << data_type_name(get_data_type(child)) << " " << name << " { ";
           temp.resize(0);
           while (data < data_end) {
             if (data < data_end) get_data_string(temp, type, dt_size, data);
@@ -241,14 +331,14 @@ public:
     }
   }
 
-  /// get the name of a node (eg. $object)
-  const char *get_name(node_index child) const {
-    return (const char*)(data.data() + nodes[child].data);
+  /// get the name of a struct_type (eg. $object)
+  const char *get_name(struct_index child) const {
+    return (const char*)(data.data() + structs[child].name);
   }
 
-  /// get the kind of a node (eg. GeometryNode)
-  const char *get_kind(node_index child) const {
-    return (const char*)(data.data() + nodes[child].kind);
+  /// get the kind of a struct_type (eg. GeometryNode)
+  const char *get_kind(struct_index child) const {
+    return (const char*)(data.data() + structs[child].kind);
   }
 
   /// get an abitrary string, such as from a property
@@ -256,8 +346,13 @@ public:
     return (const char*)(data.data() + index);
   }
 
-  std::pair<data_type_t, uint64_t> get_property(node_index child, const std::string &name) const {
-    for (const uint8_t *p = data.data() + nodes[child].props; *p; ) {
+  /// get the kind of a struct_type (eg. GeometryNode)
+  struct_index get_parent(struct_index child) const {
+    return structs[child].parent;
+  }
+
+  std::pair<data_type_t, uint64_t> get_property(struct_index child, const std::string &name) const {
+    for (const uint8_t *p = data.data() + structs[child].props; *p; ) {
       const char *this_name = (const char*)p;
       while (*p) ++p;
       p += 2;
@@ -276,10 +371,10 @@ public:
   }
 
   /// get properties as a string
-  std::string &get_prop_string(node_index child, std::string &str) const {
+  std::string &get_prop_string(struct_index child, std::string &str) const {
     str.resize(0);
     str.append("(");
-    for (const uint8_t *p = data.data() + nodes[child].props; *p; ) {
+    for (const uint8_t *p = data.data() + structs[child].props; *p; ) {
       const char *this_name = (const char*)p;
       while (*p) ++p;
       str.append(this_name, (const char*)p);
@@ -295,29 +390,44 @@ public:
     return str;
   }
 
-  /// Get the size of the data for a node.
-  data_index get_data_size(node_index child) const {
-    return nodes[child].data_size;
+  /// Get the size of the data for a struct_type.
+  data_index get_data_size(struct_index child) const {
+    return structs[child].data_size;
   }
 
-  /// Get the type of the data for a node. (eg. dt_float)
-  data_type_t get_data_type(node_index child) const {
-    return nodes[child].data_type;
+  /// Get the type of the data for a struct_type. (eg. dt_float)
+  data_type_t get_data_type(struct_index child) const {
+    return structs[child].data_type;
   }
 
-  /// Get the group size of the data for a node. (eg. 3 in float[3])
-  uint8_t get_data_group_size(node_index child) const {
-    return nodes[child].data_group_size;
+  /// Get the group size of the data for a struct_type. (eg. 3 in float[3])
+  uint8_t get_data_group_size(struct_index child) const {
+    return structs[child].data_group_size;
   }
 
-  /// Get a pointer to the data for a node
-  const uint8_t *get_data(node_index child) const {
-    return data.data() + nodes[child].data;
+  /// Get a pointer to the data for a struct_type
+  const uint8_t *get_data(struct_index child) const {
+    return structs[child].data ? data.data() + structs[child].data : (uint8_t *)0;
   }
 
-  /// Get a pointer to the properties for a node
-  const uint8_t *get_properites(node_index child) const {
-    return data.data() + nodes[child].props;
+  /// Get one datum (very slow!)
+  uint64_t get_datum(struct_index ni, size_t index) const {
+    const uint8_t *data = get_data(ni);
+    if (!data) return 0;
+    data_type_t type = get_data_type(ni);
+    size_t size = data_type_size(type);
+    uint64_t result = 0;
+    if ((index + 1) * size > get_data_size(ni)) return 0;
+    data += index * size;
+    while (size--) {
+      result = result * 256 + *data++;
+    }
+    return result;
+  }
+
+  /// Get a pointer to the properties for a struct_type
+  const uint8_t *get_properites(struct_index child) const {
+    return data.data() + structs[child].props;
   }
 
   /// add a string to the file and get the data index.
@@ -345,19 +455,23 @@ public:
     return result;
   }
 
+  std::vector<uint8_t> &get_data() {
+    return data;
+  }
+
 private:
-  /// internal POD representation of a node.
-  struct node {
+  /// internal POD representation of a structure.
+  struct struct_type {
     data_index kind = 0;
     data_index name = 0;
     data_index data = 0;
     data_index props = 0;
     data_index data_size = 0;
 
-    node_index parent = 0;
-    node_index children = 0;
-    node_index last_child = 0;
-    node_index siblings = 0;
+    struct_index parent = 0;
+    struct_index children = 0;
+    struct_index last_child = 0;
+    struct_index siblings = 0;
 
     data_type_t data_type = data_type_t::dt_invalid;
     uint8_t data_group_size = 0;
@@ -381,25 +495,31 @@ private:
       case data_type_t::dt_int16:
       case data_type_t::dt_int32:
       case data_type_t::dt_int64: {
-        _i64toa_s((std::int64_t)value << (8-size) >> (8 - size), tmp, sizeof(tmp), 10);
+        char *p = tmp;
+        int64_t val = (std::int64_t)value << (8-size) >> (8 - size);
+        if (val < 0) {
+          val = -val;
+          *p++ = '-';
+        }
+        uint64_to_dec(p, val);
         temp.append(tmp);
       } break;
       case data_type_t::dt_unsigned_int8:
       case data_type_t::dt_unsigned_int16:
       case data_type_t::dt_unsigned_int32:
       case data_type_t::dt_unsigned_int64: {
-        _ui64toa_s((std::int64_t)value << (8-size) >> (8 - size), tmp, sizeof(tmp), 10);
+        uint64_to_dec(tmp, value << (8-size) >> (8 - size));
         temp.append(tmp);
       } break;
       case data_type_t::dt_float: {
         tmp[0] = '0'; tmp[1] = 'x';
-        _ui64toa_s((std::uint32_t)value, tmp+2, sizeof(tmp)-2, 16);
+        uint64_to_hex(tmp + 2, (uint32_t)value);
         temp.append(tmp);
       } break;
 
       case data_type_t::dt_double: {
         tmp[0] = '0'; tmp[1] = 'x';
-        _ui64toa_s(value, tmp+2, sizeof(tmp)-2, 16);
+        uint64_to_hex(tmp + 2, value);
         temp.append(tmp);
       } break;
       case data_type_t::dt_string: {
@@ -409,7 +529,7 @@ private:
         temp.append("\"");
       } break;
       case data_type_t::dt_ref: {
-        temp.append(value ? get_name((node_index)value) : "null");
+        temp.append(value ? get_name((struct_index)value) : "null");
       } break;
       case data_type_t::dt_type: {
         temp.append(data_type_name((data_type_t)value));
@@ -418,7 +538,7 @@ private:
     return temp;
   }
 
-  std::vector<node> nodes;
+  std::vector<struct_type> structs;
   std::vector<uint8_t> data;
 };
 
@@ -437,12 +557,13 @@ template <class _Char, class _Err> class parser {
   const char_t *src;
   const char_t *end;
   int line_number;
+  data_index cur_data_index;
   file *ddl;
 
   std::string identifier_val;
   std::string string_val;
   uint64_t literal_val;
-  std::vector<uint8_t> data_val;
+  //std::vector<uint8_t> data_val;
   _Err err_func;
 
   template <class... args> bool err(args... a) {
@@ -548,18 +669,36 @@ template <class _Char, class _Err> class parser {
   }
 
   //  reference ::= name ("%" identifier)* | "null"
-  bool reference(node_index parent) {
+  bool reference(struct_index parent) {
     const char_t *save = src;
     
     if (identifier() && identifier_val == "null") {
       literal_val = 0;
       return true;
     } else if (name()) {
-      node_index this_node = identifier_val[0] == '$' ? ddl->get_global(identifier_val) : ddl->get_child(parent, identifier_val);
+      struct_index this_node = identifier_val[0] == '$' ? ddl->get_global(identifier_val) : ddl->get_child(parent, identifier_val);
       while (is_chr('%') && identifier()) {
-        this_node = ddl->get_child(this_node, identifier_val);
+        if (this_node) {
+          this_node = ddl->get_child(this_node, identifier_val);
+        }
       }
-      literal_val = this_node;
+      if (!this_node) {
+        if (!doing_resolve_forward_refs) {
+          // first pass: save for later
+          data_index addr = (data_index)ddl->get_data().size();
+          std::cout << "build patch @ " << addr << "\n";
+          forward_ref ref = {addr, save, parent};
+          refs.emplace_back(ref);
+          literal_val = 0;
+        } else {
+          // second pass: if we still haven't resolved the ref here report an error
+          std::string x(save, src);
+          err("undefined reference to %s", x.c_str());
+          return false;
+        }
+      } else {
+        literal_val = this_node;
+      }
       return true;
     }
     src = save;
@@ -863,9 +1002,10 @@ template <class _Char, class _Err> class parser {
   //    | "{" data-type ("," data-type)* "}" ("," "{" data-type
   //  ("," data-type)* "}")*
 
-  template <class _Fn> bool data_array(node_index this_node, data_type_t type, size_t group_size, bool grouped, _Fn literal) {
+  template <class _Fn> bool data_array(struct_index this_node, data_type_t type, size_t group_size, bool grouped, _Fn literal) {
     size_t size = data_type_size(type);
-    data_val.resize(0);
+    std::vector<uint8_t> &data_val = ddl->get_data();
+    size_t start = data_val.size();
     if (grouped) {
       while (is('{')) {
         size_t gs = 0;
@@ -890,14 +1030,14 @@ template <class _Char, class _Err> class parser {
         if (!is(',')) break;
       }
     }
-    size_t len = data_val.size();
-    ddl->set_data(this_node, data_val);
+    ddl->set_data_start(this_node, (data_index)(start));
+    ddl->set_data_size(this_node, (data_index)(data_val.size() - start));
     ddl->set_data_type(this_node, type);
     ddl->set_data_group_size(this_node, group_size);
     return true;
   }
 
-  bool data_array(node_index ni, data_type_t type, size_t group_size, bool grouped, node_index parent) {
+  bool data_array(struct_index ni, data_type_t type, size_t group_size, bool grouped, struct_index parent) {
     switch (type) {
       case data_type_t::dt_bool: {
         return data_array(ni, type, group_size, grouped, [=](data_type_t type){ return bool_literal(); });
@@ -932,9 +1072,10 @@ template <class _Char, class _Err> class parser {
   //  property ::= identifier "=" (bool-literal | integer-literal | float-literal
   //    | string-literal | reference | data-type)
 
-  bool property(node_index parent) {
+  bool property(struct_index parent) {
     const char_t *save = src;
     if (identifier() && is('=')) {
+      std::vector<uint8_t> &data_val = ddl->get_data();
       push_string(data_val, identifier_val);
       if (bool_literal()) {
         data_val.push_back((uint8_t)data_type_t::dt_bool);
@@ -954,7 +1095,7 @@ template <class _Char, class _Err> class parser {
         return true;
       } else if (reference(parent)) {
         data_val.push_back((uint8_t)data_type_t::dt_ref);
-        push_val(data_val, (node_index)literal_val);
+        push_val(data_val, (struct_index)literal_val);
         return true;
       } else if (data_type()) {
         data_val.push_back((uint8_t)data_type_t::dt_type);
@@ -970,10 +1111,10 @@ template <class _Char, class _Err> class parser {
   //    data-type (name? "{" data-list? "}" | "[" integer-literal "]" name? "{" data-array-list? "}")
   //    | identifier name? ("(" (property ("," property)*)? ")")? "{" structure* "}"
 
-  bool structure(node_index parent) {
+  bool structure(struct_index parent) {
     const char_t *save = src;
     if (data_type()) {
-      node_index this_node = ddl->add_child(parent);
+      struct_index this_node = ddl->new_structure(parent);
       data_type_t type = (data_type_t)literal_val;
       ddl->set_data_type(this_node, type);
       if (is('[')) {
@@ -1008,14 +1149,14 @@ template <class _Char, class _Err> class parser {
       }
     } else if (identifier()) {
       // eg. GeometryNode 
-      node_index this_node = ddl->add_child(parent);
+      struct_index this_node = ddl->new_structure(parent);
       ddl->set_kind(this_node, identifier_val);
       if (name()) {
         ddl->set_name(this_node, identifier_val);
       }
 
       if (is('(')) {
-        data_val.resize(0);
+        std::vector<uint8_t> &data_val = ddl->get_data();
         while (property(parent)) {
           if (!is(',')) break;
         }
@@ -1055,6 +1196,36 @@ template <class _Char, class _Err> class parser {
     size_t size = sizeof(t);
     while (size--) { dest.push_back((uint8_t)t); t >>= 8; }
   }
+
+  struct forward_ref {
+    data_index addr;
+    const char_t *src;
+    struct_index parent;
+  };
+
+  // if a reference is made before the struct is defined, we record
+  // the location of the reference in refs.
+  // this function then takes the refs and resolves them.
+  bool resolve_forward_refs() {
+    for (forward_ref &fwd : refs) {
+      src = fwd.src;
+      // re-parse
+      if (!reference(fwd.parent)) {
+        return false;
+      }
+      size_t addr = fwd.addr;
+      std::vector<uint8_t> &data_val = ddl->get_data();
+      //std::cout << "patch " << addr << " with " << literal_val << "\n";
+      for (size_t i = 0; i != sizeof(data_index); ++i) {
+        data_val[addr++] = (uint8_t)literal_val;
+        literal_val >>= 8;
+      }
+    }
+    return true;
+  }
+
+  std::vector<forward_ref> refs;
+  bool doing_resolve_forward_refs;
 public:
   parser(_Err err_func) : err_func(err_func) {
     hex_digit_set.reset();
@@ -1079,7 +1250,14 @@ public:
     src = begin;
     line_number = 1;
     skip_ws();
-    return parse_file();
+    refs.resize(0);
+    doing_resolve_forward_refs = false;
+    bool done = parse_file();
+    if (done) {
+      doing_resolve_forward_refs = true;
+      done = resolve_forward_refs();
+    }
+    return done;
   }
 };
 
